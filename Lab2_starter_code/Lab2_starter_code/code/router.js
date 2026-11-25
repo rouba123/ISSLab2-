@@ -1,5 +1,5 @@
 import express from "express";
-
+import { timingSafeEqual } from "node:crypto";
 import sleep from "./utils/sleep.js";
 import db from "./utils/db.js";
 import {
@@ -11,6 +11,13 @@ import {
 
 const router = express.Router();
 
+function ensureCsrfToken(req) {
+  if (!req.session.csrfToken) {
+    req.session.csrfToken = generateRandomness();
+  }
+  return req.session.csrfToken;
+}
+
 function render(req, res, page, title, errorMsg = false, result = null) {
   res.render("layout/template", {
     page,
@@ -19,6 +26,7 @@ function render(req, res, page, title, errorMsg = false, result = null) {
     account: req.session.account,
     errorMsg,
     result,
+    csrfToken: ensureCsrfToken(req),
   });
 }
 
@@ -45,7 +53,6 @@ router.get("/get_login", (req, res) => {
   );
   const result = query.get();
   if (result && checkPassword(req.query.password, result)) {
-    // if username and password are valid
     sleep(1000);
     req.session.loggedIn = true;
     req.session.account = result;
@@ -67,11 +74,11 @@ router.get("/register", (req, res) => {
 
 router.post("/post_register", (req, res) => {
   let query = db.prepare(
-    `SELECT * FROM Users WHERE username == '${req.body.username}';`,
-  );
-  let result = query.get();
+  "SELECT * FROM Users WHERE username == ?;"
+);
+let result = query.get(req.body.username);
+
   if (result && result.username === req.body.username) {
-    // if username exists
     render(
       req,
       res,
@@ -81,12 +88,15 @@ router.post("/post_register", (req, res) => {
     );
     return;
   }
+
   const salt = generateRandomness();
   const hashedPassword = KDF(req.body.password, salt);
+
   query = db.prepare(
     `INSERT INTO Users(username, hashedPassword, salt, profile, bitbars) VALUES(?, ?, ?, ?, ?)`,
   );
   query.run(req.body.username, hashedPassword, salt, "", 100);
+
   req.session.loggedIn = true;
   req.session.account = {
     username: req.body.username,
@@ -95,6 +105,7 @@ router.post("/post_register", (req, res) => {
     profile: "",
     bitbars: 100,
   };
+
   render(req, res, "register/success", "Bitbar Home");
 });
 
@@ -109,12 +120,15 @@ router.get("/close", (req, res) => {
     );
     return;
   }
+
   const query = db.prepare(
-    `DELETE FROM Users WHERE username == '${req.session.account.username}';`,
-  );
-  query.run();
+  "DELETE FROM Users WHERE username == ?;"
+);
+query.run(req.session.account.username);
+
   req.session.loggedIn = false;
   req.session.account = {};
+
   render(req, res, "index", "Bitbar Home", "Deleted account successfully!");
 });
 
@@ -137,16 +151,14 @@ router.get("/profile", (req, res) => {
   }
 
   if (req.query.username != null) {
-    // if visitor makes a search query
-    const query = db.prepare(
-      `SELECT * FROM Users WHERE username == '${req.query.username}';`,
-    );
-    const result = query.get();
+   const query = db.prepare(
+  "SELECT * FROM Users WHERE username == ?;"
+);
+const result = query.get(req.query.username);
+
     if (result) {
-      // if user exists
       render(req, res, "profile/view", "View Profile", false, result);
     } else {
-      // user does not exist
       render(
         req,
         res,
@@ -157,7 +169,6 @@ router.get("/profile", (req, res) => {
       );
     }
   } else {
-    // visitor did not make query, show them their own profile
     render(
       req,
       res,
@@ -180,6 +191,7 @@ router.get("/transfer", (req, res) => {
     );
     return;
   }
+
   render(req, res, "transfer/form", "Transfer Bitbars", false, {
     receiver: null,
     amount: null,
@@ -187,6 +199,24 @@ router.get("/transfer", (req, res) => {
 });
 
 router.post("/post_transfer", (req, res) => {
+  const expectedToken = req.session.csrfToken;
+  const submittedToken = req.body.csrfToken;
+
+  const validToken =
+    typeof expectedToken === "string" &&
+    typeof submittedToken === "string" &&
+    /^[0-9a-f]{64}$/i.test(expectedToken) &&
+    /^[0-9a-f]{64}$/i.test(submittedToken) &&
+    timingSafeEqual(
+      Buffer.from(submittedToken, "hex"),
+      Buffer.from(expectedToken, "hex"),
+    );
+
+  if (!validToken) {
+    res.status(403).send("CSRF validation failed.");
+    return;
+  }
+
   if (req.session.loggedIn == false) {
     render(
       req,
@@ -210,13 +240,14 @@ router.post("/post_transfer", (req, res) => {
     return;
   }
 
-  let query = db.prepare(
-    `SELECT * FROM Users WHERE username == '${req.body.destination_username}';`,
+    let query = db.prepare(
+    "SELECT * FROM Users WHERE username == ?;"
   );
-  const receiver = query.get();
+  const receiver = query.get(req.body.destination_username);
+
   if (receiver) {
-    // if user exists
     const amount = parseInt(req.body.quantity);
+
     if (
       Number.isNaN(amount) ||
       amount > req.session.account.bitbars ||
@@ -234,29 +265,34 @@ router.post("/post_transfer", (req, res) => {
     }
 
     req.session.account.bitbars -= amount;
+
     query = db.prepare(
       `UPDATE Users SET bitbars = '${req.session.account.bitbars}' WHERE username == '${req.session.account.username}';`,
     );
     query.run();
+
     const receiverNewBal = receiver.bitbars + amount;
+
     query = db.prepare(
       `UPDATE Users SET bitbars = '${receiverNewBal}' WHERE username == '${receiver.username}';`,
     );
     query.run();
+
     render(req, res, "transfer/success", "Transfer Complete", false, {
       receiver,
       amount,
     });
   } else {
-    // user does not exist
     let q = req.body.destination_username;
     if (q == null) q = "";
 
     let oldQ;
+
     while (q !== oldQ) {
       oldQ = q;
       q = q.replace(/script|SCRIPT|img|IMG/g, "");
     }
+
     render(
       req,
       res,
